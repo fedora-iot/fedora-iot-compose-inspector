@@ -1,9 +1,9 @@
 name: Daily Fedora IoT Compose Check
 
 on:
-  # Trigger 1: On a schedule (every day at 11:30 UTC)
+  # Trigger 1: On a schedule (every day at 12:30 UTC)
   schedule:
-    - cron: '30 11 * * *'
+    - cron: '30 12 * * *'
   
   # Trigger 2: Manually from the Actions tab
   workflow_dispatch:
