@@ -19,7 +19,7 @@ load_dotenv()
 # --- Configurations ---
 COMPOSE_BASE_URL = "https://kojipkgs.fedoraproject.org/compose/iot/"
 # TODO add a logic to get this version number based on GA or something.
-VERSIONS_TO_CHECK = ["43", "42", "41"]
+VERSIONS_TO_CHECK = ["44", "43", "42", "41"]
 REPOS_TO_SEARCH = ["osbuild/osbuild-composer", "osbuild/images"]
 RETRY_COUNT = 3
 RETRY_DELAY_SECONDS = 60
