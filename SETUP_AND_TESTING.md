@@ -29,10 +29,11 @@ It uses the AI's structured analysis plus raw-log evidence, and compares only th
 meaningful bug-report fields rather than reproduction-template text. The matching
 decision remains locally verified against the logs.
 
-* **How to get it:** Follow the guide to create a "classic" Personal Access Token.
-* **Guide:** [Creating a personal access token](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens#creating-a-personal-access-token-classic)
-  * **Scope/Permission needed:** You only need to grant the `public_repo` scope.
-  * **Note:** Copy the token immediately after generation. You will not see it again.
+* **How to get it:** If the unauthenticated rate limit is insufficient, create a
+  fine-grained personal access token with the minimum access your organization
+  allows. Public issue reads do not require a token.
+* **Guide:** [Managing personal access tokens](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens)
+* **Note:** Copy the token immediately after generation. You will not see it again.
 
 **3. Slack Incoming Webhook URL**
 This URL is used to post the compose analysis and Quay reports to a Slack channel.
