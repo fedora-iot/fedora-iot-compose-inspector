@@ -4,15 +4,17 @@ This document provides all the necessary steps for a developer to set up the rep
 
 ## 1. One-Time Project Setup
 
-To make the automation work, you must generate three secret keys and add them to your GitHub repository's settings.
+The inspector needs Google Cloud credentials for AI analysis. A GitHub token and
+Slack webhook are optional for local testing; configure a webhook in GitHub Actions
+to post the scheduled reports.
 
-### Step 1.1: Generate the Secrets
+### Step 1.1: Configure Credentials
 
 **1. Google Cloud credentials for Claude on Vertex AI**
 The AI analysis uses LangChain's `ChatAnthropicVertex` integration. Authenticate
 with Google Application Default Credentials locally (`gcloud auth application-default
-login`) or configure the GitHub workflow with a service account/workload identity that
-can invoke Claude on Vertex AI. Set `ANTHROPIC_VERTEX_PROJECT_ID` and
+login`) or provide the GitHub workflow with a `GCP_SA_KEY` service account JSON key
+that can invoke Claude on Vertex AI. Set `ANTHROPIC_VERTEX_PROJECT_ID` and
 `CLOUD_ML_REGION` for the target project and region.
 
 The log-analysis and final-synthesis models are configured separately in
@@ -20,8 +22,9 @@ The log-analysis and final-synthesis models are configured separately in
 file without editing the repository default.
 
 **2. GitHub Personal Access Token**
-This token lets the inspector automatically compare failure signatures with open
-issues in `fedora-iot/iot-distro` and report potential prior reports in Slack.
+The inspector compares failure signatures with open issues in
+`fedora-iot/iot-distro` and reports potential prior reports in Slack. An optional
+token raises the GitHub API rate limit for these requests.
 It uses the AI's structured analysis plus raw-log evidence, and compares only the
 meaningful bug-report fields rather than reproduction-template text. The matching
 decision remains locally verified against the logs.
@@ -32,12 +35,10 @@ decision remains locally verified against the logs.
   * **Note:** Copy the token immediately after generation. You will not see it again.
 
 **3. Slack Incoming Webhook URL**
-This URL is used to post the final summary report to a Slack channel.
-Note: Since a slack channel is already created, all the developers need not
-create a new webhook. The same can be copied to your settings.
-SLACK_WEBHOOK_URL=""
+This URL is used to post the compose analysis and Quay reports to a Slack channel.
+The existing team webhook can be reused where access is authorized.
+Without a webhook, local runs preview the reports instead of posting them.
 
-(still mentioning the step if needed to create from scratch)
 * **How to get it:** Follow the guide to create a new Incoming Webhook.
 * **Guide:** [Sending messages using Incoming Webhooks](https://api.slack.com/messaging/webhooks)
   1. Create a minimal Slack "App".
@@ -50,9 +51,10 @@ SLACK_WEBHOOK_URL=""
 1. In your GitHub repository, go to **`Settings`**.
 2. In the left sidebar, navigate to **`Security` > `Secrets and variables` > `Actions`**.
 3. Ensure you are on the **`Secrets`** tab.
-4. Click **`New repository secret`** for each of the keys you generated. **The names must be an exact match**:
-   * `MY_GITHUB_TOKEN`: The `ghp_...` token you got from GitHub.
-   * `SLACK_WEBHOOK_URL`: The webhook URL you got from Slack.
+4. Click **`New repository secret`** for each credential you use. **The names must be an exact match**:
+   * `GCP_SA_KEY`: The service account JSON key used by the workflow for Vertex AI.
+   * `MY_GITHUB_TOKEN`: Optional token for authenticated GitHub API requests.
+   * `SLACK_WEBHOOK_URL`: The webhook URL for scheduled Slack reports.
 
 ---
 
@@ -81,17 +83,16 @@ Your terminal prompt should now be prefixed with (.venv).
 pip install -r requirements.txt
 ```
 
-### Step 2.4: Create a Local .env File for Secrets
-The script needs your secret keys to run locally. In the root directory of your project, create a new file named .env. 
-Add your secrets to this file using the format VARIABLE_NAME="value".
-This file is for local development only. Do not commit it.
+### Step 2.4: Configure the Local Environment
+Copy the template to `.env`, set `ANTHROPIC_VERTEX_PROJECT_ID` to a project with
+access to the configured models, and authenticate with Google Cloud. The template
+uses `us-east5`, matching the scheduled workflow. Uncomment the optional GitHub
+token or Slack webhook only if you need them. Keep `.env` out of version control.
 
-ANTHROPIC_VERTEX_PROJECT_ID="your-google-cloud-project"
-CLOUD_ML_REGION="global"
-# Optional: path to a different JSON model configuration
-# AI_MODEL_CONFIG="/path/to/ai_models.json"
-MY_GITHUB_TOKEN="ghp_YourGitHubTokenGoesHere"
-SLACK_WEBHOOK_URL="[https://hooks.slack.com/services/your/webhook/url/here](https://hooks.slack.com/services/your/webhook/url/here)"
+```bash
+cp .env.template .env
+gcloud auth application-default login
+```
 
 ### Step 2.5: Run the Script
 You are now ready to run the script locally.

@@ -52,10 +52,10 @@ You MUST respond with ONLY valid JSON, no other text:
   "missing_packages": ["list if applicable, empty otherwise"],
   "remediation": "one evidence-backed fix, or an empty string",
   "issue_report": {
-    "describe_the_bug": "concise evidence-backed bug description",
+    "bug_description": "concise evidence-backed bug description",
     "expected_behavior": "what should have completed instead",
-    "os_version": "Fedora IoT version/build and affected architectures from the logs, or unknown",
-    "additional_context": "relevant component, failing command, and error context; do not include reproduction steps"
+    "os_version": "Fedora IoT version/build from the logs, or unknown",
+    "additional_context": "relevant component, failing command, and error context; do not repeat affected architectures or include reproduction steps"
   },
   "severity": "critical|high|medium|low",
   "needs_human_investigation": false,
@@ -72,7 +72,7 @@ say so. Copy evidence excerpts exactly from the source.
 Return ONLY valid JSON:
 {
   "source": "exact supplied source name",
-  "status": "confirmed|inconclusive|no_signal",
+  "status": "confirmed|inconclusive|no_evidence",
   "phase": "compose phase or unknown",
   "issue_summary": "confirmed issue from this source, or inconclusive",
   "component": "affected component or unknown",
@@ -171,7 +171,7 @@ def analyze_log_source(chat_model, source, excerpt, available_sources):
         return {
             "source": source,
             "status": "inconclusive",
-            "issue_summary": "Per-log AI analysis did not return valid JSON.",
+            "issue_summary": "Per-log AI analysis did not return a valid JSON object.",
             "evidence": [],
             "needs_more_context": True,
             "requested_next_sources": [],
@@ -196,12 +196,15 @@ def synthesize_log_analyses(chat_model, log_analyses, available_sources):
 
 
 def parse_ai_json(raw_text):
-    """Parse JSON from an AI response, allowing an optional Markdown code fence."""
+    """Parse a JSON object from an AI response, allowing an optional code fence."""
     cleaned = raw_text.strip()
     if cleaned.startswith("```"):
         cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
         cleaned = re.sub(r"\s*```$", "", cleaned)
-    return json.loads(cleaned)
+    result = json.loads(cleaned)
+    if not isinstance(result, dict):
+        raise ValueError("AI response must be a JSON object")
+    return result
 
 
 def analysis_match_terms(result, normalize_terms):
@@ -232,17 +235,26 @@ def format_issue_report(result, compose_url, version_name):
     if not isinstance(report, dict):
         report = {}
 
-    describe = report.get("describe_the_bug") or result.get("issue_summary", "Unknown issue")
+    describe = report.get("bug_description") or result.get("issue_summary", "Unknown issue")
     expected = report.get("expected_behavior") or "The Fedora IoT compose completes successfully."
     os_version = report.get("os_version") or version_name
     additional = report.get("additional_context") or "See the verified log evidence below."
+    affected_arches = result.get("affected_arches", [])
+    if not isinstance(affected_arches, list):
+        affected_arches = []
+    affected_arches = list(dict.fromkeys(
+        arch for arch in affected_arches if isinstance(arch, str) and arch
+    ))
 
-    return "\n".join([
+    report_lines = [
         "*Issue report*",
         f"*Describe the bug:* {compact_text(describe, 420)}",
         f"*To Reproduce:* Automated compose failure: <{compose_url}|{version_name}>. "
         "No manual reproduction steps were generated.",
         f"*Expected behavior:* {compact_text(expected, 280)}",
         f"*OS version:* {compact_text(os_version, 180)}",
-        f"*Additional context:* {compact_text(additional, 420)}",
-    ])
+    ]
+    if affected_arches:
+        report_lines.append(f"*Affected architectures:* {compact_text(', '.join(affected_arches), 180)}")
+    report_lines.append(f"*Additional context:* {compact_text(additional, 420)}")
+    return "\n".join(report_lines)

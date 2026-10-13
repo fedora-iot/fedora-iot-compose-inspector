@@ -17,7 +17,7 @@ from ai_analysis import (
     create_langchain_models,
     synthesize_log_analyses,
 )
-from utils import extract_signal_windows, prioritize_items
+from utils import compact_text, extract_signal_windows, prioritize_items
 
 load_dotenv()
 
@@ -198,7 +198,7 @@ def check_compose_status(compose_url):
 def get_compose_latest_artifact_time(compose_url):
     """Return the latest artifact timestamp recorded in compose images metadata.
 
-    Pungi's images.json stores an mtime for each produced artifact.  The latest
+    Pungi's images.json stores an mtime for each produced artifact. The latest
     one is the best timestamp available for when this compose's image output
     finished; it lets us state whether a Quay tag changed afterwards.
     """
@@ -242,7 +242,7 @@ def quay_updated_after_compose(compose_artifact_time, quay_last_modified):
         compose_time = datetime.fromisoformat(compose_artifact_time).astimezone(timezone.utc)
         quay_time = parsedate_to_datetime(quay_last_modified)
         # Quay uses -0000, which Python represents as a naive datetime even
-        # though the API timestamp is UTC.  Never let the runner's local zone
+        # though the API timestamp is UTC. Never let the runner's local zone
         # change the Yes/No comparison.
         if quay_time.tzinfo is None:
             quay_time = quay_time.replace(tzinfo=timezone.utc)
@@ -307,12 +307,16 @@ def check_quay_container(repo, tag):
         response = requests.get(f"{QUAY_API_URL}/repository/{repo}/tag/?specificTag={tag}", timeout=30)
         response.raise_for_status()
         tags = response.json().get("tags", [])
+        if not isinstance(tags, list):
+            raise ValueError("Malformed Quay tag list")
         if tags:
-            tag = tags[0]
+            tag_data = tags[0]
+            if not isinstance(tag_data, dict):
+                raise ValueError("Malformed Quay tag data")
             return {
                 "exists": True,
-                "manifest_digest": tag.get("manifest_digest"),
-                "last_modified": tag.get("last_modified", "unknown"),
+                "manifest_digest": tag_data.get("manifest_digest"),
+                "last_modified": tag_data.get("last_modified", "unknown"),
             }
         return {"exists": False}
     except Exception as e:
@@ -576,10 +580,23 @@ def collect_failure_logs(compose_url):
 
 
 def affected_arches_from_logs(logs):
-    """Read affected architectures from deliverables data when it is available."""
+    """Read failed architectures from deliverables data when it is available."""
     deliverables = logs.get("deliverables.json", "")
     known_arches = ["x86_64", "aarch64", "s390x", "ppc64le"]
-    return [arch for arch in known_arches if re.search(rf"\b{re.escape(arch)}\b", deliverables)]
+    try:
+        failed = json.loads(deliverables).get("failed", {})
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        return []
+    if not isinstance(failed, dict):
+        return []
+
+    failed_arches = {
+        item[1]
+        for entries in failed.values() if isinstance(entries, list)
+        for item in entries
+        if isinstance(item, (list, tuple)) and len(item) > 1 and isinstance(item[1], str)
+    }
+    return [arch for arch in known_arches if arch in failed_arches]
 
 
 def log_analysis_order(logs):
@@ -647,31 +664,26 @@ def log_source_url(compose_url, source):
 
 
 def verified_log_snapshot(logs, evidence):
-    """Find a small real-log excerpt nearest to the AI's claimed evidence."""
-    claimed_source = evidence.get("source", "") if isinstance(evidence, dict) else ""
-    claimed_excerpt = evidence.get("excerpt", "") if isinstance(evidence, dict) else ""
-    search_sources = [(claimed_source, logs[claimed_source])] if claimed_source in logs else list(logs.items())
-    claimed_terms = normalized_issue_terms(claimed_excerpt)
-    best_match = None
-
-    for source, content in search_sources:
-        lines = content.splitlines()
-        for index, line in enumerate(lines):
-            line_terms = normalized_issue_terms(line)
-            matched_terms = claimed_terms & line_terms
-            if claimed_terms and not matched_terms:
-                continue
-            score = len(matched_terms)
-            if ISSUE_SIGNAL.search(line):
-                score += 1
-            if score and (best_match is None or score > best_match[0]):
-                best_match = (score, source, lines, index)
-
-    if not best_match:
+    """Return context around an exact AI excerpt in its claimed log source."""
+    if not isinstance(evidence, dict):
+        return None, None
+    source = evidence.get("source")
+    excerpt = evidence.get("excerpt")
+    if not isinstance(source, str) or source not in logs:
+        return None, None
+    if not isinstance(excerpt, str) or not excerpt.strip():
         return None, None
 
-    _, source, lines, index = best_match
-    snapshot = "\n".join(lines[max(0, index - 1):index + 2]).strip()
+    content = logs[source].replace("\r\n", "\n").replace("\r", "\n")
+    excerpt = excerpt.strip().replace("\r\n", "\n").replace("\r", "\n")
+    start = content.find(excerpt)
+    if start < 0:
+        return None, None
+
+    lines = content.splitlines()
+    first_line = content.count("\n", 0, start)
+    last_line = content.count("\n", 0, start + len(excerpt))
+    snapshot = "\n".join(lines[max(0, first_line - 1):last_line + 2]).strip()
     return source, snapshot[:600]
 
 
@@ -723,6 +735,8 @@ def diagnose_failure(compose_url, version_name):
     # Format output - simplified for Slack readability
     severity = result.get('severity', 'unknown')
     evidence = result.get("evidence", [])
+    if not isinstance(evidence, list):
+        evidence = []
     remediation = result.get("remediation", "")
     investigation_reason = result.get("investigation_reason", "")
 
@@ -747,20 +761,50 @@ def diagnose_failure(compose_url, version_name):
 # OUTPUT: SLACK NOTIFICATION
 # ============================================================
 
+SLACK_SECTION_LIMIT = 3000
+
+
+def slack_section_blocks(lines):
+    """Split report lines into section blocks that meet Slack's text limit."""
+    blocks = []
+    current = ""
+
+    def add_section(text):
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": text}})
+
+    for line in "\n".join(lines).split("\n"):
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) <= SLACK_SECTION_LIMIT:
+            current = candidate
+            continue
+
+        if current:
+            add_section(current)
+        while len(line) > SLACK_SECTION_LIMIT:
+            add_section(line[:SLACK_SECTION_LIMIT])
+            line = line[SLACK_SECTION_LIMIT:]
+        current = line
+
+    if current:
+        add_section(current)
+    return blocks
+
+
 def send_slack_notification(blocks):
     """Send a structured Slack message, or print to stdout if no webhook configured."""
     for block in blocks:
         if block.get("type") == "section":
             text = block.get("text", {}).get("text", "")
-            if len(text) > 3500:
-                block["text"]["text"] = text[:3500] + "\n... _(truncated)_"
+            if not 1 <= len(text) <= SLACK_SECTION_LIMIT:
+                print(f"Error: Slack section must contain 1-{SLACK_SECTION_LIMIT} characters.")
+                return False
 
     # Disable Slack for testing - set DISABLE_SLACK=true to skip sending
     if os.getenv("DISABLE_SLACK", "false").lower() == "true":
         print("\n" + "=" * 60)
         print("SLACK DISABLED (DISABLE_SLACK=true)")
         print("=" * 60)
-        return
+        return True
 
     if not SLACK_WEBHOOK_URL:
         print("\n" + "=" * 60)
@@ -779,9 +823,9 @@ def send_slack_notification(blocks):
             elif btype == "divider":
                 print("-" * 40)
         print("=" * 60)
-        return
+        return True
 
-    print("Sending summary to Slack...")
+    print("Sending Slack report...")
     try:
         response = requests.post(
             SLACK_WEBHOOK_URL,
@@ -791,13 +835,14 @@ def send_slack_notification(blocks):
         )
         response.raise_for_status()
         print("Slack notification sent successfully.")
+        return True
     except requests.exceptions.RequestException as e:
         print(f"Error sending Slack notification: {e}")
+        return False
 
 
 def format_slack_blocks(date_str, version_reports):
-    """Build structured Slack blocks from version reports."""
-    # Build simple text message for better readability
+    """Build the compose status and failure-analysis Slack report."""
     status_emojis = {
         "FINISHED": ":white_check_mark:",
         "FINISHED_INCOMPLETE": ":warning:",
@@ -806,17 +851,13 @@ def format_slack_blocks(date_str, version_reports):
         "MISSING": ":x:",
     }
 
-    message_lines = [
-        f":newspaper: *Fedora IoT Compose Status - {date_str}*",
-        ""
-    ]
+    blocks = slack_section_blocks([f":newspaper: *Fedora IoT Compose Status - {date_str}*"])
 
     for report in version_reports:
         emoji = status_emojis.get(report["status"], ":question:")
         version = report['version']
         status = report['status']
 
-        # Build status line
         if status in ("FINISHED", "STARTED"):
             line = f"{emoji} *Fedora-IoT-{version}:* Compose {status.lower()}"
         elif status == "MISSING":
@@ -824,13 +865,11 @@ def format_slack_blocks(date_str, version_reports):
         else:
             line = f"{emoji} *Fedora-IoT-{version}:* Failed with status {status}"
 
-        message_lines.append(line)
+        lines = [line]
 
-        # Add compose URL if available
         if report.get("compose_url"):
-            message_lines.append(f"   • <{report['compose_url']}|View compose directory>")
+            lines.append(f"   • <{report['compose_url']}|View compose directory>")
 
-        # Add openQA summary
         oqa = report.get("openqa")
         if oqa and oqa.get("total", 0) > 0:
             oqa_parts = []
@@ -847,31 +886,54 @@ def format_slack_blocks(date_str, version_reports):
                 oqa_text = f"   • openQA: {', '.join(oqa_parts)}"
                 if oqa.get("url"):
                     oqa_text += f" — <{oqa['url']}|View tests>"
-                message_lines.append(oqa_text)
+                lines.append(oqa_text)
 
-            # Show failed tests
             if oqa["failed_tests"]:
                 failed_list = ", ".join(oqa["failed_tests"][:3])
                 if len(oqa["failed_tests"]) > 3:
                     failed_list += f" +{len(oqa['failed_tests']) - 3} more"
-                message_lines.append(f"   • Failed tests: {failed_list}")
+                lines.append(f"   • Failed tests: {failed_list}")
 
-        # Add immutable Quay digest when available; otherwise retain the timestamp
-        # as the best available indication of when the mutable version tag changed.
-        for repo, container in report.get("containers", {}).items():
+        if report.get("diagnosis"):
+            lines.extend(["", "   :robot_face: *AI Analysis:*", f"   {report['diagnosis']}"])
+
+        blocks.extend(slack_section_blocks(lines))
+
+    blocks.extend(slack_section_blocks([f"<{RUN_URL}|View full GitHub Actions run log>"]))
+    return blocks
+
+
+def format_quay_slack_blocks(date_str, version_reports):
+    """Build a separate report for Quay manifest digests and update times."""
+    blocks = slack_section_blocks([f":package: *Fedora IoT Quay Manifest Digests - {date_str}*"])
+
+    for report in version_reports:
+        version = report["version"]
+        lines = [f"*Fedora-IoT-{version}*"]
+        containers = report.get("containers", {})
+        if not containers:
+            lines.append("   • No Quay data available for this compose")
+
+        for repo, container in containers.items():
+            if container.get("error"):
+                lines.append(
+                    f"   • Quay: `{repo}:{version}` check unavailable "
+                    f"({compact_text(container['error'], 160)})"
+                )
+                continue
             if not container.get("exists"):
-                message_lines.append(f"   • Quay: `{repo}:{version}` tag not found")
+                lines.append(f"   • Quay: `{repo}:{version}` tag not found")
                 continue
 
             digest = container.get("manifest_digest")
             last_modified = container.get("last_modified", "unknown")
             if digest:
-                message_lines.append(
+                lines.append(
                     f"   • Quay: `{repo}:{version}` → `{digest}` "
                     f"(last modified: {last_modified})"
                 )
             else:
-                message_lines.append(
+                lines.append(
                     f"   • Quay: `{repo}:{version}` last modified: {last_modified} "
                     "(manifest digest unavailable)"
                 )
@@ -883,26 +945,12 @@ def format_slack_blocks(date_str, version_reports):
                 answer = "*No*"
             else:
                 answer = "Unknown (compose or Quay timestamp unavailable)"
-            message_lines.append(f"   • Quay updated after compose run: {answer}")
+            lines.append(f"   • Quay updated after compose run: {answer}")
 
-        # Add AI diagnosis for failures
-        if report.get("diagnosis"):
-            message_lines.append("")
-            message_lines.append(f"   :robot_face: *AI Analysis:*")
-            message_lines.append(f"   {report['diagnosis']}")
+        blocks.extend(slack_section_blocks(lines))
 
-        message_lines.append("")  # Blank line between versions
-
-    # Add footer
-    message_lines.append(f"<{RUN_URL}|View full GitHub Actions run log>")
-
-    # Return as simple blocks
-    return [
-        {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": "\n".join(message_lines)}
-        }
-    ]
+    blocks.extend(slack_section_blocks([f"<{RUN_URL}|View full GitHub Actions run log>"]))
+    return blocks
 
 
 # ============================================================
@@ -1031,8 +1079,12 @@ def main():
         icon = {"FINISHED": "OK", "STARTED": "IN PROGRESS"}.get(r["status"], "ISSUE")
         print(f"  [{icon}] Fedora IoT {r['version']}: {r['status']}")
 
-    send_slack_notification(format_slack_blocks(current_date_display, reports))
     save_daily_report(current_date_str, reports)
+    compose_sent = send_slack_notification(format_slack_blocks(current_date_display, reports))
+    quay_sent = send_slack_notification(format_quay_slack_blocks(current_date_display, reports))
+    if not (compose_sent and quay_sent):
+        print("One or more Slack reports could not be sent.")
+        sys.exit(1)
 
     if has_failure:
         print("\nInspection finished with one or more issues.")

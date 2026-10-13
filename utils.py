@@ -41,6 +41,11 @@ def extract_signal_windows(content, signal_pattern, context_lines=1, max_windows
 
 def prioritize_items(items, preferred_items):
     """Move requested items to the front while retaining each original item once."""
-    preferred = [item for item in preferred_items if item in items]
-    remaining = [item for item in items if item not in preferred]
-    return preferred + remaining
+    ordered = []
+    for item in preferred_items:
+        if item in items and item not in ordered:
+            ordered.append(item)
+    for item in items:
+        if item not in ordered:
+            ordered.append(item)
+    return ordered

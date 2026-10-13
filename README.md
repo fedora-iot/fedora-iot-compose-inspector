@@ -2,6 +2,8 @@
 
 The inspector checks Fedora IoT compose status, openQA, Quay containers, failed
 compose logs, and related open `fedora-iot/iot-distro` issues.
+Slack receives two messages: compose status and failure analysis, followed by
+Quay manifest digests and update times.
 
 Python 3.14+ may display an upstream LangChain/Pydantic compatibility warning during
 AI initialization. The inspector leaves that warning visible rather than disabling AI.
