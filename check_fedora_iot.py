@@ -7,6 +7,17 @@ from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 import time
 import json
+from email.utils import parsedate_to_datetime
+
+from ai_analysis import (
+    analysis_match_terms,
+    format_issue_report,
+    parse_ai_json,
+    analyze_log_source,
+    create_langchain_models,
+    synthesize_log_analyses,
+)
+from utils import compact_text, extract_signal_windows, prioritize_items
 
 load_dotenv()
 
@@ -15,24 +26,30 @@ COMPOSE_BASE_URL = "https://kojipkgs.fedoraproject.org/compose/iot/"
 OPENQA_API_URL = "https://openqa.fedoraproject.org/api/v1"
 QUAY_API_URL = "https://quay.io/api/v1"
 QUAY_REPOS = ["fedora/fedora-iot", "fedora/fedora-bootc"]
+ISSUE_REPOSITORY = os.getenv("ISSUE_REPOSITORY", "fedora-iot/iot-distro")
+ISSUE_LIST_URL = f"https://github.com/{ISSUE_REPOSITORY}/issues"
+MAX_RELATED_ISSUES = 3
+MAX_LOG_ANALYSES = 8
 RETRY_COUNT = 3
 RETRY_DELAY_SECONDS = 60
 RUN_URL = f"https://github.com/{os.getenv('GITHUB_REPOSITORY', 'your/repo')}/actions/runs/{os.getenv('GITHUB_RUN_ID', 'local')}"
 
-# --- AI Configuration (Claude on Vertex AI) ---
-# Use same configuration as Claude Code session
-VERTEX_PROJECT_ID = os.getenv("ANTHROPIC_VERTEX_PROJECT_ID", "itpc-ca-b7a2ceb3c4")
-VERTEX_REGION = os.getenv("CLOUD_ML_REGION", "us-east5")
-AI_MODEL = os.getenv("AI_MODEL", "claude-sonnet-4-5@20250929")
-ai_client = None
+# --- AI Configuration (LangChain + Claude on Vertex AI) ---
+VERTEX_PROJECT_ID = os.getenv("ANTHROPIC_VERTEX_PROJECT_ID", "itpc-ca-XXXXXXXXXX")
+VERTEX_REGION = os.getenv("CLOUD_ML_REGION", "global")
+AI_MODEL_CONFIG = os.getenv(
+    "AI_MODEL_CONFIG", os.path.join(os.path.dirname(__file__), "ai_models.json")
+)
+ai_models = None
 
 try:
-    from anthropic import AnthropicVertex
-    # Initialize with project and region
-    ai_client = AnthropicVertex(project_id=VERTEX_PROJECT_ID, region=VERTEX_REGION)
-    print(f"AI configured: Claude on Vertex AI (project={VERTEX_PROJECT_ID}, region={VERTEX_REGION}, model={AI_MODEL})")
+    ai_models = create_langchain_models(AI_MODEL_CONFIG, VERTEX_PROJECT_ID, VERTEX_REGION)
+    print(
+        "AI configured through LangChain "
+        f"(project={VERTEX_PROJECT_ID}, region={VERTEX_REGION}, config={AI_MODEL_CONFIG})"
+    )
 except Exception as e:
-    print(f"Warning: Could not configure Claude on Vertex AI: {e}. AI analysis will be disabled.")
+    print(f"Warning: Could not configure LangChain AI models: {e}. AI analysis will be disabled.")
 
 # --- GitHub API ---
 try:
@@ -178,6 +195,64 @@ def check_compose_status(compose_url):
     return status_content.strip()
 
 
+def get_compose_latest_artifact_time(compose_url):
+    """Return the latest artifact timestamp recorded in compose images metadata.
+
+    Pungi's images.json stores an mtime for each produced artifact. The latest
+    one is the best timestamp available for when this compose's image output
+    finished; it lets us state whether a Quay tag changed afterwards.
+    """
+    content = get_url_content(f"{compose_url}compose/metadata/images.json", silent=True)
+    if not content:
+        return None
+
+    try:
+        metadata = json.loads(content)
+    except json.JSONDecodeError:
+        print("    -> Could not parse compose images.json metadata")
+        return None
+
+    mtimes = []
+
+    def collect_mtimes(value):
+        if isinstance(value, dict):
+            mtime = value.get("mtime")
+            if isinstance(mtime, (int, float)):
+                mtimes.append(mtime)
+            for child in value.values():
+                collect_mtimes(child)
+        elif isinstance(value, list):
+            for child in value:
+                collect_mtimes(child)
+
+    collect_mtimes(metadata.get("payload", metadata))
+    if not mtimes:
+        print("    -> Compose images.json did not contain artifact timestamps")
+        return None
+
+    return datetime.fromtimestamp(max(mtimes), timezone.utc).isoformat()
+
+
+def quay_updated_after_compose(compose_artifact_time, quay_last_modified):
+    """Return whether a Quay tag changed after this compose's last artifact."""
+    if not compose_artifact_time or not quay_last_modified or quay_last_modified == "unknown":
+        return None
+
+    try:
+        compose_time = datetime.fromisoformat(compose_artifact_time).astimezone(timezone.utc)
+        quay_time = parsedate_to_datetime(quay_last_modified)
+        # Quay uses -0000, which Python represents as a naive datetime even
+        # though the API timestamp is UTC. Never let the runner's local zone
+        # change the Yes/No comparison.
+        if quay_time.tzinfo is None:
+            quay_time = quay_time.replace(tzinfo=timezone.utc)
+        quay_time = quay_time.astimezone(timezone.utc)
+    except (AttributeError, TypeError, ValueError, IndexError):
+        return None
+
+    return quay_time > compose_time
+
+
 def check_openqa_results(version, build_name):
     """Query openQA API for IoT test results."""
     results = {
@@ -232,8 +307,17 @@ def check_quay_container(repo, tag):
         response = requests.get(f"{QUAY_API_URL}/repository/{repo}/tag/?specificTag={tag}", timeout=30)
         response.raise_for_status()
         tags = response.json().get("tags", [])
+        if not isinstance(tags, list):
+            raise ValueError("Malformed Quay tag list")
         if tags:
-            return {"exists": True, "last_modified": tags[0].get("last_modified", "unknown")}
+            tag_data = tags[0]
+            if not isinstance(tag_data, dict):
+                raise ValueError("Malformed Quay tag data")
+            return {
+                "exists": True,
+                "manifest_digest": tag_data.get("manifest_digest"),
+                "last_modified": tag_data.get("last_modified", "unknown"),
+            }
         return {"exists": False}
     except Exception as e:
         print(f"    -> Quay.io API error for {repo}:{tag}: {e}")
@@ -241,35 +325,140 @@ def check_quay_container(repo, tag):
 
 
 # ============================================================
-# PART 2: AI FAILURE ANALYSIS
+# PART 2: AUTOMATED ISSUE CORRELATION + AI FAILURE ANALYSIS
 # ============================================================
 
-def run_ai_analysis(context, prompt_instructions):
-    """Run AI analysis using Claude on Vertex AI."""
-    if not ai_client:
-        return "AI analysis unavailable: Claude on Vertex AI not configured."
+ISSUE_MATCH_STOP_WORDS = {
+    "about", "after", "also", "build", "cannot", "command", "compose",
+    "container", "could", "error", "exception", "failed", "failure", "fedora",
+    "file", "from", "image", "into", "iot", "missing", "package", "root",
+    "service", "status", "that", "the", "this", "with",
+}
+ISSUE_SIGNAL = re.compile(
+    r"(?:\berror\b|\bfailed\b|\bfailure\b|\bexception\b|traceback|"
+    r"not found|missing|cannot|no such file|exit code)",
+    re.IGNORECASE,
+)
+ISSUE_REPORT_SECTIONS = {
+    "describe the bug", "expected behavior", "os version", "additional context",
+}
 
-    full_prompt = f"{prompt_instructions}\n\n**Context:**\n---\n{context}\n---"
+
+def normalized_issue_terms(text):
+    """Return comparable, non-generic tokens while preserving package/service names."""
+    terms = re.findall(r"[a-z][a-z0-9_.+:-]{3,}", text.lower())
+    return {
+        term.strip("._+:-") for term in terms
+        if term.strip("._+:-") not in ISSUE_MATCH_STOP_WORDS
+    }
+
+
+def issue_match_terms(logs):
+    """Extract distinctive terms from failure lines for deterministic issue matching."""
+    failure_lines = []
+    for content in logs.values():
+        for line in content.splitlines():
+            if ISSUE_SIGNAL.search(line) and "/sys/fs/selinux/" not in line:
+                failure_lines.append(line)
+
+    # Use a bounded recent sample so normal log messages do not become a signature.
+    failure_text = "\n".join(failure_lines[-100:]).lower()
+    return {term for term in normalized_issue_terms(failure_text) if not term.isdigit()}
+
+
+def issue_report_text(title, body):
+    """Use only meaningful fields from the iot-distro bug-report template."""
+    sections = []
+    active_section = None
+    for line in (body or "").splitlines():
+        heading = line.strip().strip("#").strip().strip("*").strip().rstrip(":").lower()
+        if heading in ISSUE_REPORT_SECTIONS:
+            active_section = heading
+            continue
+        if heading in {"to reproduce", "screenshots"}:
+            active_section = None
+            continue
+        if active_section and line.strip() and not line.lstrip().startswith("Please replace this line"):
+            sections.append(line)
+
+    # Older issues may not use the current template, so retain their body as a fallback.
+    relevant_text = "\n".join(sections) if sections else (body or "")
+    return f"{title or ''}\n{relevant_text}"
+
+
+def find_related_open_issues(logs, analysis_result=None):
+    """Match structured analysis and raw log evidence with open issues.
+
+    The AI improves terminology, but a candidate must still share raw-log evidence
+    with an existing issue before it is reported.
+    """
+    log_terms = issue_match_terms(logs)
+    if not log_terms:
+        return [], None
+    ai_terms = analysis_match_terms(analysis_result, normalized_issue_terms)
+
     try:
-        response = ai_client.messages.create(
-            model=AI_MODEL,
-            max_tokens=2048,
-            messages=[{"role": "user", "content": full_prompt}]
-        )
-        return response.content[0].text
+        repository = g.get_repo(ISSUE_REPOSITORY)
+        matches = []
+        for issue in repository.get_issues(state="open", sort="updated", direction="desc"):
+            issue_terms = normalized_issue_terms(issue_report_text(issue.title, issue.body))
+            title_terms = normalized_issue_terms(issue.title or "")
+            log_shared_terms = sorted(log_terms & issue_terms)
+            ai_shared_terms = sorted(ai_terms & issue_terms)
+            shared_terms = sorted(set(log_shared_terms) | set(ai_shared_terms))
+            score = sum(min(len(term), 12) for term in shared_terms)
+            distinctive_match = any(len(term) >= 12 for term in log_shared_terms)
+            narrow_title_match = (
+                len(title_terms) <= 2
+                and any(len(term) >= 5 and term in title_terms for term in log_shared_terms)
+            )
+            raw_log_match = distinctive_match or narrow_title_match or (
+                len(log_shared_terms) >= 2
+                and sum(min(len(term), 12) for term in log_shared_terms) >= 12
+            )
+            analysis_assisted_match = bool(log_shared_terms) and len(shared_terms) >= 2 and score >= 12
+            if not (raw_log_match or analysis_assisted_match):
+                continue
+
+            matches.append({
+                "number": issue.number,
+                "title": issue.title,
+                "url": issue.html_url,
+                "matched_log_terms": log_shared_terms[:4],
+                "matched_analysis_terms": ai_shared_terms[:4],
+                "confidence": "high" if raw_log_match else "medium",
+                "score": score,
+            })
+
+        matches.sort(key=lambda item: item["score"], reverse=True)
+        return matches[:MAX_RELATED_ISSUES], None
     except Exception as e:
-        print(f"    -> Claude analysis failed: {e}")
-        return f"AI analysis failed: {e}"
+        print(f"    -> Open issue lookup failed: {e}")
+        return [], str(e)
 
 
-def parse_ai_json(raw_text):
-    """Parse JSON from AI response, stripping markdown code fences if present."""
-    cleaned = raw_text.strip()
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r'^```(?:json)?\s*', '', cleaned)
-        cleaned = re.sub(r'\s*```$', '', cleaned)
-    return json.loads(cleaned)
+def format_open_issue_check(related_issues, lookup_error):
+    """Format the automatic open-issue check for Slack or CLI output."""
+    if lookup_error:
+        return f"*Open-issue check:* unavailable ({lookup_error[:160]})"
+    if not related_issues:
+        return (
+            f"*Open-issue check:* no matching open issue found in "
+            f"<{ISSUE_LIST_URL}|fedora-iot/iot-distro>."
+        )
 
+    formatted = []
+    for issue in related_issues:
+        log_terms = ", ".join(issue["matched_log_terms"])
+        ai_terms = ", ".join(issue["matched_analysis_terms"])
+        match_text = f"log: {log_terms}"
+        if ai_terms:
+            match_text += f"; analysis: {ai_terms}"
+        formatted.append(
+            f"<{issue['url']}|#{issue['number']} {issue['title']}> "
+            f"({issue['confidence']} confidence; {match_text})"
+        )
+    return "*Potential related open issues:* " + "; ".join(formatted)
 
 def find_koji_task_urls(compose_url):
     """Find Koji task URLs from osbuild/ or koji-tasks/ log directories."""
@@ -352,41 +541,6 @@ def get_koji_task_logs(koji_task_url):
     return None
 
 
-DIAGNOSIS_PROMPT = """You are an expert Fedora IoT build engineer. You are given multiple log files from a
-failed Fedora IoT compose. Your job is to identify the EXACT root cause — not a guess,
-not a suggestion to "check more logs." The logs are already provided to you.
-
-ANALYSIS RULES:
-1. Read ALL provided logs before forming a conclusion.
-2. deliverables.json tells you WHAT failed (which architectures, which deliverable type).
-3. pungi.global.log gives the high-level flow and phase where failure occurred.
-4. runroot.log / build.log / root.log contain the ACTUAL error — find the specific
-   error message, traceback, or exit code.
-5. For BuildrootError: identify what command failed and the exact reason (permission,
-   missing file, disk space, stale mount, etc).
-6. For FileNotFoundError: identify the Fedora package that provides the missing command.
-7. For ostree/container errors: check for repo issues, signing problems, or ref mismatches.
-8. Ignore noise: "Read-only file system" on /sys/fs/selinux/ is normal in build chroots.
-
-YOUR RESPONSE MUST BE:
-- The DEFINITIVE root cause, not speculation
-- If the logs don't contain enough info, say exactly what's missing
-- Actionable — tell the user what to DO, not what to investigate
-
-You MUST respond with ONLY valid JSON, no other text:
-{
-  "root_cause": "definitive one-line root cause",
-  "error_message": "exact error message or traceback from the logs",
-  "failure_type": "IMAGE_BUILD|DEPENDENCIES|INFRASTRUCTURE|CONFIGURATION",
-  "affected_arches": ["list of affected architectures"],
-  "missing_packages": ["list if applicable, empty otherwise"],
-  "recommended_actions": ["specific actionable steps to fix this"],
-  "severity": "critical|high|medium|low",
-  "needs_human_investigation": false,
-  "investigation_reason": "only if needs_human_investigation is true, explain what's missing"
-}"""
-
-
 def collect_failure_logs(compose_url):
     """Gather all available log data from a failed compose. Returns a dict of log sources."""
     logs = {}
@@ -412,7 +566,6 @@ def collect_failure_logs(compose_url):
         if content and len(content.strip()) > 50:
             print(f"      -> Found runroot.log for {arch} ({len(content)} bytes)")
             logs[f"runroot.log ({arch})"] = content
-            break  # One arch is usually enough — same error on all
 
     # Koji task logs (build.log, root.log, do_mounts.log, compose-status.json)
     print("  --- Collecting Koji task logs ---")
@@ -426,57 +579,181 @@ def collect_failure_logs(compose_url):
     return logs
 
 
+def affected_arches_from_logs(logs):
+    """Read failed architectures from deliverables data when it is available."""
+    deliverables = logs.get("deliverables.json", "")
+    known_arches = ["x86_64", "aarch64", "s390x", "ppc64le"]
+    try:
+        failed = json.loads(deliverables).get("failed", {})
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        return []
+    if not isinstance(failed, dict):
+        return []
+
+    failed_arches = {
+        item[1]
+        for entries in failed.values() if isinstance(entries, list)
+        for item in entries
+        if isinstance(item, (list, tuple)) and len(item) > 1 and isinstance(item[1], str)
+    }
+    return [arch for arch in known_arches if arch in failed_arches]
+
+
+def log_analysis_order(logs):
+    """Choose a deterministic order from metadata to root-cause logs."""
+    affected_arches = affected_arches_from_logs(logs)
+    matching_runroots = [
+        f"runroot.log ({arch})" for arch in affected_arches
+        if f"runroot.log ({arch})" in logs
+    ]
+    remaining_runroots = [
+        source for source in logs if source.startswith("runroot.log")
+        and source not in matching_runroots
+    ]
+    koji_sources = [source for source in logs if source.startswith("koji_task_")]
+
+    ordered = [
+        source for source in ("deliverables.json", "pungi.global.log") if source in logs
+    ]
+    ordered.extend(matching_runroots)
+    ordered.extend(koji_sources)
+    ordered.extend(remaining_runroots)
+    return ordered[:MAX_LOG_ANALYSES]
+
+
+def run_staged_log_analysis(logs):
+    """Analyze each relevant source in bounded rounds before final synthesis.
+
+    Metadata is analyzed first, then the affected architecture's runroot logs,
+    followed by the implicated Koji task and any remaining architectures. A per-log
+    analysis may request an available source; that request only reprioritizes the
+    remaining deterministic plan and cannot fetch arbitrary data.
+    """
+    pending_sources = log_analysis_order(logs)
+    analyses = []
+
+    while pending_sources and len(analyses) < MAX_LOG_ANALYSES:
+        source = pending_sources.pop(0)
+        excerpt = extract_signal_windows(
+            logs[source], ISSUE_SIGNAL, context_lines=2, max_windows=4, max_chars=8000
+        )
+        print(f"  --- Analyzing {source} ({len(excerpt)} chars of relevant context) ---")
+        result = analyze_log_source(ai_models["log_analysis"], source, excerpt, pending_sources)
+        analyses.append(result)
+        pending_sources = prioritize_items(
+            pending_sources, result.get("requested_next_sources", [])
+        )
+
+    return analyses
+
+
+def log_source_url(compose_url, source):
+    """Resolve a collected source name to a browser-visible log or Koji task URL."""
+    if source == "pungi.global.log":
+        return f"{compose_url}logs/global/pungi.global.log"
+    if source == "deliverables.json":
+        return f"{compose_url}logs/global/deliverables.json"
+    arch_match = re.fullmatch(r"runroot\.log \(([^)]+)\)", source)
+    if arch_match:
+        arch = arch_match.group(1)
+        return f"{compose_url}logs/{arch}/IoT/ostree-container-1/runroot.log"
+    task_match = re.fullmatch(r"koji_task_(\d+)", source)
+    if task_match:
+        return f"https://koji.fedoraproject.org/koji/taskinfo?taskID={task_match.group(1)}"
+    return f"{compose_url}logs/"
+
+
+def verified_log_snapshot(logs, evidence):
+    """Return context around an exact AI excerpt in its claimed log source."""
+    if not isinstance(evidence, dict):
+        return None, None
+    source = evidence.get("source")
+    excerpt = evidence.get("excerpt")
+    if not isinstance(source, str) or source not in logs:
+        return None, None
+    if not isinstance(excerpt, str) or not excerpt.strip():
+        return None, None
+
+    content = logs[source].replace("\r\n", "\n").replace("\r", "\n")
+    excerpt = excerpt.strip().replace("\r\n", "\n").replace("\r", "\n")
+    start = content.find(excerpt)
+    if start < 0:
+        return None, None
+
+    lines = content.splitlines()
+    first_line = content.count("\n", 0, start)
+    last_line = content.count("\n", 0, start + len(excerpt))
+    snapshot = "\n".join(lines[max(0, first_line - 1):last_line + 2]).strip()
+    return source, snapshot[:600]
+
+
+def format_verified_evidence(compose_url, logs, evidence):
+    """Render only an evidence snapshot that can be traced back to collected logs."""
+    source, snapshot = verified_log_snapshot(logs, evidence)
+    if not snapshot:
+        return "*Verified log evidence:* no matching excerpt could be located in collected logs."
+
+    safe_snapshot = snapshot.replace("```", "'''")
+    source_url = log_source_url(compose_url, source)
+    return f"*Verified log evidence (<{source_url}|{source}>):*\n```{safe_snapshot}```"
+
+
 def diagnose_failure(compose_url, version_name):
-    """Collect all available logs and run a single comprehensive AI analysis."""
+    """Collect logs, check existing issues, then run the AI diagnosis."""
     print(f"  Starting AI diagnosis for {version_name}...")
 
     logs = collect_failure_logs(compose_url)
     if not logs:
         return "_No log files found for analysis._"
 
-    # Build combined context, budget ~15K chars total
-    context_parts = []
-    total_len = 0
-    for source, content in logs.items():
-        available = 15000 - total_len
-        if available <= 500:
-            break
-        truncated = content[:available]
-        context_parts.append(f"=== {source} ===\n{truncated}")
-        total_len += len(truncated)
+    if not ai_models:
+        print(f"  --- Checking open issues in {ISSUE_REPOSITORY} (raw-log fallback) ---")
+        related_issues, issue_lookup_error = find_related_open_issues(logs)
+        issue_check = format_open_issue_check(related_issues, issue_lookup_error)
+        return f"_AI diagnosis unavailable._\n{issue_check}"
 
-    print(f"  -> Collected {len(logs)} log sources, {total_len} chars total")
-
-    # Single comprehensive AI call
-    print("  --- Running AI analysis on all collected logs ---")
-    raw_analysis = run_ai_analysis("\n\n".join(context_parts), DIAGNOSIS_PROMPT)
-    print(f"  AI result: {raw_analysis}")
+    print(f"  -> Collected {len(logs)} log sources")
+    log_analyses = run_staged_log_analysis(logs)
+    print(f"  --- Synthesizing {len(log_analyses)} per-log analyses ---")
+    raw_analysis = synthesize_log_analyses(
+        ai_models["synthesis"], log_analyses, [analysis["source"] for analysis in log_analyses]
+    )
+    print(f"  Final AI result: {raw_analysis}")
 
     try:
         result = parse_ai_json(raw_analysis)
     except (json.JSONDecodeError, ValueError):
-        return f"*AI Diagnosis:*\n```{raw_analysis[:2500]}```"
+        print(f"  --- Checking open issues in {ISSUE_REPOSITORY} (raw-log fallback) ---")
+        related_issues, issue_lookup_error = find_related_open_issues(logs)
+        issue_check = format_open_issue_check(related_issues, issue_lookup_error)
+        return f"*AI Diagnosis:*\n```{raw_analysis[:2500]}```\n{issue_check}"
+
+    print(f"  --- Checking open issues in {ISSUE_REPOSITORY} ---")
+    related_issues, issue_lookup_error = find_related_open_issues(logs, result)
+    issue_check = format_open_issue_check(related_issues, issue_lookup_error)
 
     # Format output - simplified for Slack readability
-    root_cause = result.get('root_cause', 'Unknown')
     severity = result.get('severity', 'unknown')
-    actions = result.get("recommended_actions", [])
+    evidence = result.get("evidence", [])
+    if not isinstance(evidence, list):
+        evidence = []
+    remediation = result.get("remediation", "")
+    investigation_reason = result.get("investigation_reason", "")
 
-    # Build concise diagnosis
-    diagnosis_parts = [
-        f"_{root_cause}_ (Severity: {severity})"
-    ]
+    diagnosis_parts = [f"*Severity:* {severity}", format_issue_report(result, compose_url, version_name)]
 
-    # Add top 3 action items only
-    if actions:
-        diagnosis_parts.append("Recommended actions:")
-        for i, action in enumerate(actions[:3], 1):
-            # Truncate long actions
-            short_action = action[:100] + "..." if len(action) > 100 else action
-            diagnosis_parts.append(f"     {i}. {short_action}")
-        if len(actions) > 3:
-            diagnosis_parts.append(f"     ... and {len(actions) - 3} more")
+    if evidence:
+        first_evidence = evidence[0] if isinstance(evidence[0], dict) else {}
+        diagnosis_parts.append(format_verified_evidence(compose_url, logs, first_evidence))
+    else:
+        diagnosis_parts.append("*Verified log evidence:* no evidence excerpt was returned by the AI.")
 
+    if remediation:
+        diagnosis_parts.append(f"*Remediation:* {remediation}")
+    elif result.get("needs_human_investigation") and investigation_reason:
+        diagnosis_parts.append(f"*Missing evidence:* {investigation_reason}")
+
+    diagnosis_parts.append(issue_check)
     return "\n".join(diagnosis_parts)
 
 
@@ -484,20 +761,50 @@ def diagnose_failure(compose_url, version_name):
 # OUTPUT: SLACK NOTIFICATION
 # ============================================================
 
+SLACK_SECTION_LIMIT = 3000
+
+
+def slack_section_blocks(lines):
+    """Split report lines into section blocks that meet Slack's text limit."""
+    blocks = []
+    current = ""
+
+    def add_section(text):
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": text}})
+
+    for line in "\n".join(lines).split("\n"):
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) <= SLACK_SECTION_LIMIT:
+            current = candidate
+            continue
+
+        if current:
+            add_section(current)
+        while len(line) > SLACK_SECTION_LIMIT:
+            add_section(line[:SLACK_SECTION_LIMIT])
+            line = line[SLACK_SECTION_LIMIT:]
+        current = line
+
+    if current:
+        add_section(current)
+    return blocks
+
+
 def send_slack_notification(blocks):
     """Send a structured Slack message, or print to stdout if no webhook configured."""
     for block in blocks:
         if block.get("type") == "section":
             text = block.get("text", {}).get("text", "")
-            if len(text) > 2900:
-                block["text"]["text"] = text[:2900] + "\n... _(truncated)_"
+            if not 1 <= len(text) <= SLACK_SECTION_LIMIT:
+                print(f"Error: Slack section must contain 1-{SLACK_SECTION_LIMIT} characters.")
+                return False
 
     # Disable Slack for testing - set DISABLE_SLACK=true to skip sending
     if os.getenv("DISABLE_SLACK", "false").lower() == "true":
         print("\n" + "=" * 60)
         print("SLACK DISABLED (DISABLE_SLACK=true)")
         print("=" * 60)
-        return
+        return True
 
     if not SLACK_WEBHOOK_URL:
         print("\n" + "=" * 60)
@@ -516,9 +823,9 @@ def send_slack_notification(blocks):
             elif btype == "divider":
                 print("-" * 40)
         print("=" * 60)
-        return
+        return True
 
-    print("Sending summary to Slack...")
+    print("Sending Slack report...")
     try:
         response = requests.post(
             SLACK_WEBHOOK_URL,
@@ -528,13 +835,14 @@ def send_slack_notification(blocks):
         )
         response.raise_for_status()
         print("Slack notification sent successfully.")
+        return True
     except requests.exceptions.RequestException as e:
         print(f"Error sending Slack notification: {e}")
+        return False
 
 
 def format_slack_blocks(date_str, version_reports):
-    """Build structured Slack blocks from version reports."""
-    # Build simple text message for better readability
+    """Build the compose status and failure-analysis Slack report."""
     status_emojis = {
         "FINISHED": ":white_check_mark:",
         "FINISHED_INCOMPLETE": ":warning:",
@@ -543,17 +851,13 @@ def format_slack_blocks(date_str, version_reports):
         "MISSING": ":x:",
     }
 
-    message_lines = [
-        f":newspaper: *Fedora IoT Compose Status - {date_str}*",
-        ""
-    ]
+    blocks = slack_section_blocks([f":newspaper: *Fedora IoT Compose Status - {date_str}*"])
 
     for report in version_reports:
         emoji = status_emojis.get(report["status"], ":question:")
         version = report['version']
         status = report['status']
 
-        # Build status line
         if status in ("FINISHED", "STARTED"):
             line = f"{emoji} *Fedora-IoT-{version}:* Compose {status.lower()}"
         elif status == "MISSING":
@@ -561,13 +865,11 @@ def format_slack_blocks(date_str, version_reports):
         else:
             line = f"{emoji} *Fedora-IoT-{version}:* Failed with status {status}"
 
-        message_lines.append(line)
+        lines = [line]
 
-        # Add compose URL if available
         if report.get("compose_url"):
-            message_lines.append(f"   • <{report['compose_url']}|View compose directory>")
+            lines.append(f"   • <{report['compose_url']}|View compose directory>")
 
-        # Add openQA summary
         oqa = report.get("openqa")
         if oqa and oqa.get("total", 0) > 0:
             oqa_parts = []
@@ -584,33 +886,71 @@ def format_slack_blocks(date_str, version_reports):
                 oqa_text = f"   • openQA: {', '.join(oqa_parts)}"
                 if oqa.get("url"):
                     oqa_text += f" — <{oqa['url']}|View tests>"
-                message_lines.append(oqa_text)
+                lines.append(oqa_text)
 
-            # Show failed tests
             if oqa["failed_tests"]:
                 failed_list = ", ".join(oqa["failed_tests"][:3])
                 if len(oqa["failed_tests"]) > 3:
                     failed_list += f" +{len(oqa['failed_tests']) - 3} more"
-                message_lines.append(f"   • Failed tests: {failed_list}")
+                lines.append(f"   • Failed tests: {failed_list}")
 
-        # Add AI diagnosis for failures
         if report.get("diagnosis"):
-            message_lines.append("")
-            message_lines.append(f"   :robot_face: *AI Analysis:*")
-            message_lines.append(f"   {report['diagnosis']}")
+            lines.extend(["", "   :robot_face: *AI Analysis:*", f"   {report['diagnosis']}"])
 
-        message_lines.append("")  # Blank line between versions
+        blocks.extend(slack_section_blocks(lines))
 
-    # Add footer
-    message_lines.append(f"<{RUN_URL}|View full GitHub Actions run log>")
+    blocks.extend(slack_section_blocks([f"<{RUN_URL}|View full GitHub Actions run log>"]))
+    return blocks
 
-    # Return as simple blocks
-    return [
-        {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": "\n".join(message_lines)}
-        }
-    ]
+
+def format_quay_slack_blocks(date_str, version_reports):
+    """Build a separate report for Quay manifest digests and update times."""
+    blocks = slack_section_blocks([f":package: *Fedora IoT Quay Manifest Digests - {date_str}*"])
+
+    for report in version_reports:
+        version = report["version"]
+        lines = [f"*Fedora-IoT-{version}*"]
+        containers = report.get("containers", {})
+        if not containers:
+            lines.append("   • No Quay data available for this compose")
+
+        for repo, container in containers.items():
+            if container.get("error"):
+                lines.append(
+                    f"   • Quay: `{repo}:{version}` check unavailable "
+                    f"({compact_text(container['error'], 160)})"
+                )
+                continue
+            if not container.get("exists"):
+                lines.append(f"   • Quay: `{repo}:{version}` tag not found")
+                continue
+
+            digest = container.get("manifest_digest")
+            last_modified = container.get("last_modified", "unknown")
+            if digest:
+                lines.append(
+                    f"   • Quay: `{repo}:{version}` → `{digest}` "
+                    f"(last modified: {last_modified})"
+                )
+            else:
+                lines.append(
+                    f"   • Quay: `{repo}:{version}` last modified: {last_modified} "
+                    "(manifest digest unavailable)"
+                )
+
+            updated_after_compose = container.get("updated_after_compose")
+            if updated_after_compose is True:
+                answer = "*Yes*"
+            elif updated_after_compose is False:
+                answer = "*No*"
+            else:
+                answer = "Unknown (compose or Quay timestamp unavailable)"
+            lines.append(f"   • Quay updated after compose run: {answer}")
+
+        blocks.extend(slack_section_blocks(lines))
+
+    blocks.extend(slack_section_blocks([f"<{RUN_URL}|View full GitHub Actions run log>"]))
+    return blocks
 
 
 # ============================================================
@@ -638,6 +978,11 @@ def inspect_version(version, all_links, current_date_str):
     report["status"] = status
     print(f"  -> Status: {status}")
 
+    print("  -> Reading compose artifact timestamps...")
+    report["compose_latest_artifact_time"] = get_compose_latest_artifact_time(compose_url)
+    if report["compose_latest_artifact_time"]:
+        print(f"     Latest artifact: {report['compose_latest_artifact_time']}")
+
     print(f"  -> Checking openQA results...")
     report["openqa"] = check_openqa_results(version, build_name)
     oqa = report["openqa"]
@@ -645,15 +990,13 @@ def inspect_version(version, all_links, current_date_str):
 
     print(f"  -> Checking Quay.io containers...")
     report["containers"] = {repo: check_quay_container(repo, version) for repo in QUAY_REPOS}
+    for container in report["containers"].values():
+        container["updated_after_compose"] = quay_updated_after_compose(
+            report["compose_latest_artifact_time"], container.get("last_modified")
+        )
 
     if status in ("DOOMED", "FINISHED_INCOMPLETE"):
-        if ai_client:
-            report["diagnosis"] = diagnose_failure(compose_url, f"Fedora-IoT-{version}")
-        else:
-            report["diagnosis"] = (
-                f":information_source: *Manual investigation needed*\n"
-                f"Check logs at: <{compose_url}logs/|Compose logs directory>"
-            )
+        report["diagnosis"] = diagnose_failure(compose_url, f"Fedora-IoT-{version}")
 
     return report
 
@@ -673,8 +1016,8 @@ def save_daily_report(date_str, reports):
 
 def run_diagnose(build_name):
     """Run AI diagnosis on a specific compose build (e.g. Fedora-IoT-42-20260427.0)."""
-    if not ai_client:
-        print("ERROR: AI client not configured. Run 'gcloud auth application-default login' first.")
+    if not ai_models:
+        print("ERROR: LangChain AI models not configured. Run 'gcloud auth application-default login' first.")
         sys.exit(1)
 
     compose_url = f"{COMPOSE_BASE_URL}{build_name}/"
@@ -736,8 +1079,12 @@ def main():
         icon = {"FINISHED": "OK", "STARTED": "IN PROGRESS"}.get(r["status"], "ISSUE")
         print(f"  [{icon}] Fedora IoT {r['version']}: {r['status']}")
 
-    send_slack_notification(format_slack_blocks(current_date_display, reports))
     save_daily_report(current_date_str, reports)
+    compose_sent = send_slack_notification(format_slack_blocks(current_date_display, reports))
+    quay_sent = send_slack_notification(format_quay_slack_blocks(current_date_display, reports))
+    if not (compose_sent and quay_sent):
+        print("One or more Slack reports could not be sent.")
+        sys.exit(1)
 
     if has_failure:
         print("\nInspection finished with one or more issues.")
